@@ -42,8 +42,87 @@ local function parseSpeed(speed)
   elseif speed == "slow" then return 0.08
   else
     assert(tonumber(speed), "setSpeed() - Expected number, got " .. tostring(speed))
-    return speed
+    return tonumber(speed)
   end
+end
+
+local function cloneColor(color)
+  return {
+    color[1] or 1,
+    color[2] or 1,
+    color[3] or 1,
+    color[4] == nil and 1 or color[4],
+  }
+end
+
+local function cloneStyle(style, tagName)
+  return {
+    color = cloneColor(style.color),
+    font = style.font,
+    speed = style.speed,
+    tagName = tagName,
+  }
+end
+
+local function sameRenderStyle(a, b)
+  if a.font ~= b.font then
+    return false
+  end
+
+  for i = 1, 4 do
+    local av = a.color[i]
+    local bv = b.color[i]
+    if i == 4 then
+      av = av == nil and 1 or av
+      bv = bv == nil and 1 or bv
+    end
+
+    if av ~= bv then
+      return false
+    end
+  end
+
+  return true
+end
+
+local function parseHexColor(value)
+  local hex = value:gsub("^#", "")
+  if #hex ~= 6 and #hex ~= 8 then
+    return nil
+  end
+
+  local red = tonumber(hex:sub(1, 2), 16)
+  local green = tonumber(hex:sub(3, 4), 16)
+  local blue = tonumber(hex:sub(5, 6), 16)
+  if red == nil or green == nil or blue == nil then
+    return nil
+  end
+
+  local color = {
+    red / 255,
+    green / 255,
+    blue / 255,
+  }
+
+  if #hex == 8 then
+    local alpha = tonumber(hex:sub(7, 8), 16)
+    if alpha == nil then
+      return nil
+    end
+    color[4] = alpha / 255
+  else
+    color[4] = 1
+  end
+
+  return color
+end
+
+local function findFirstCharacterSpeed(charSteps, defaultSpeed)
+  local firstChar = charSteps[1]
+  if firstChar ~= nil then
+    return firstChar.speed
+  end
+  return defaultSpeed
 end
 
 local Fifo = {}
@@ -65,50 +144,444 @@ function Fifo:pop()
 end
 
 local Typer = {}
-function Typer.new(msg, speed)
-  local timeToType = parseSpeed(speed)
-  
-  local strip = string.gsub(msg, "\n","")
-  
+local function isRichMessage(message)
+  return type(message) == "table" and message._talkiesRich == true
+end
+
+local function addRenderText(message, text, style)
+  if text == "" then
+    return
+  end
+
+  local lastToken = message.renderTokens[#message.renderTokens]
+  if lastToken ~= nil and lastToken.type == "text" and sameRenderStyle(lastToken.style, style) then
+    lastToken.text = lastToken.text .. text
+  else
+    message.renderTokens[#message.renderTokens + 1] = {
+      type = "text",
+      text = text,
+      style = style,
+    }
+  end
+
+  for _, codepoint in utf8.codes(text) do
+    local character = utf8.char(codepoint)
+    message.visibleLength = message.visibleLength + 1
+    message.charSteps[message.visibleLength] = {
+      speed = style.speed,
+      audible = character ~= " ",
+    }
+  end
+end
+
+local function addPause(message)
+  local pauseIndex = message.visibleLength
+  message.pauseCounts[pauseIndex] = (message.pauseCounts[pauseIndex] or 0) + 1
+end
+
+local function addNewline(message)
+  message.renderTokens[#message.renderTokens + 1] = { type = "newline" }
+end
+
+local function tryHandleRichTag(rawTag, styleStack, message, context)
+  local tag = rawTag:gsub("^%s+", ""):gsub("%s+$", "")
+  if tag == "" then
+    return false
+  end
+
+  local closingTag = tag:match("^/(%a+)$")
+  if closingTag ~= nil then
+    local currentStyle = styleStack[#styleStack]
+    if #styleStack > 1 and currentStyle.tagName == closingTag then
+      table.remove(styleStack)
+      return true
+    end
+    return false
+  end
+
+  if tag == "pause" then
+    addPause(message)
+    return true
+  elseif tag == "br" then
+    addNewline(message)
+    return true
+  end
+
+  local tagName, value = tag:match("^(%a+)%=(.+)$")
+  if tagName == nil then
+    return false
+  end
+
+  local currentStyle = styleStack[#styleStack]
+  local nextStyle
+
+  if tagName == "color" then
+    local color = parseHexColor(value)
+    assert(color ~= nil, "Talkies.rich() - Invalid color tag [" .. tag .. "]")
+    nextStyle = cloneStyle(currentStyle, "color")
+    nextStyle.color = color
+  elseif tagName == "font" then
+    local font = context.richFonts[value]
+    assert(font ~= nil, "Talkies.rich() - Unknown rich font '" .. tostring(value) .. "'")
+    nextStyle = cloneStyle(currentStyle, "font")
+    nextStyle.font = font
+  elseif tagName == "speed" then
+    local ok, speed = pcall(parseSpeed, value)
+    assert(ok, "Talkies.rich() - Invalid speed tag [" .. tag .. "]")
+    nextStyle = cloneStyle(currentStyle, "speed")
+    nextStyle.speed = speed
+  else
+    return false
+  end
+
+  styleStack[#styleStack + 1] = nextStyle
+  return true
+end
+
+local function parseMessage(messageInput, context)
+  local allowRichTags = false
+  local source = messageInput
+
+  if isRichMessage(messageInput) then
+    allowRichTags = true
+    source = messageInput.source
+  end
+
+  assert(type(source) == "string", "Talkies.say() - Expected message to be a string or Talkies.rich(...), got " .. type(source))
+
+  local defaultStyle = {
+    color = cloneColor(context.messageColor),
+    font = context.font,
+    speed = context.textSpeed,
+  }
+
+  local parsed = {
+    renderTokens = {},
+    charSteps = {},
+    pauseCounts = {},
+    visibleLength = 0,
+  }
+
+  local styleStack = { defaultStyle }
+  local index = 1
+
+  while index <= #source do
+    local currentChar = source:sub(index, index)
+
+    if allowRichTags and currentChar == "[" then
+      local closeIndex = source:find("]", index, true)
+      if closeIndex ~= nil then
+        local rawTag = source:sub(index + 1, closeIndex - 1)
+        if tryHandleRichTag(rawTag, styleStack, parsed, context) then
+          index = closeIndex + 1
+        else
+          addRenderText(parsed, "[", styleStack[#styleStack])
+          index = index + 1
+        end
+      else
+        addRenderText(parsed, "[", styleStack[#styleStack])
+        index = index + 1
+      end
+    elseif source:sub(index, index + 1) == "--" then
+      addPause(parsed)
+      index = index + 2
+    elseif currentChar == "\n" then
+      addNewline(parsed)
+      index = index + 1
+    else
+      local stop = index
+      while stop <= #source do
+        local nextChar = source:sub(stop, stop)
+        if nextChar == "\n" or source:sub(stop, stop + 1) == "--" or (allowRichTags and nextChar == "[") then
+          break
+        end
+        stop = stop + 1
+      end
+
+      addRenderText(parsed, source:sub(index, stop - 1), styleStack[#styleStack])
+      index = stop
+    end
+  end
+
+  return parsed
+end
+
+local function newLayoutLine(defaultLineHeight)
+  return {
+    runs = {},
+    width = 0,
+    height = defaultLineHeight,
+  }
+end
+
+local function appendLayoutRun(line, text, style)
+  if text == "" then
+    return
+  end
+
+  local width = style.font:getWidth(text)
+  local length = utf8.len(text)
+  local lastRun = line.runs[#line.runs]
+
+  if lastRun ~= nil and sameRenderStyle(lastRun.style, style) then
+    lastRun.text = lastRun.text .. text
+    lastRun.width = lastRun.width + width
+    lastRun.length = lastRun.length + length
+  else
+    line.runs[#line.runs + 1] = {
+      text = text,
+      style = style,
+      width = width,
+      length = length,
+    }
+  end
+
+  line.width = line.width + width
+  line.height = math.max(line.height, style.font:getHeight())
+end
+
+local function takeChunkThatFits(text, font, maxWidth)
+  local chunk = ""
+  local chunkWidth = 0
+
+  for _, codepoint in utf8.codes(text) do
+    local character = utf8.char(codepoint)
+    local nextWidth = chunkWidth + font:getWidth(character)
+    if chunk ~= "" and nextWidth > maxWidth then
+      break
+    end
+
+    chunk = chunk .. character
+    chunkWidth = nextWidth
+  end
+
+  if chunk == "" then
+    local firstCharacter = utf8.sub(text, 1, 1)
+    return firstCharacter, utf8.sub(text, 2, -1), font:getWidth(firstCharacter)
+  end
+
+  local chunkLength = utf8.len(chunk)
+  local textLength = utf8.len(text)
+  local rest = ""
+  if chunkLength < textLength then
+    rest = utf8.sub(text, chunkLength + 1, -1)
+  end
+
+  return chunk, rest, chunkWidth
+end
+
+local function layoutMessage(renderTokens, width, defaultLineHeight)
+  local lines = { newLayoutLine(defaultLineHeight) }
+  local currentLine = lines[1]
+
+  local function startNewLine()
+    currentLine = newLayoutLine(defaultLineHeight)
+    lines[#lines + 1] = currentLine
+  end
+
+  local function placeText(text, style, isSpace)
+    if text == "" then
+      return
+    end
+
+    if isSpace then
+      if currentLine.width == 0 then
+        return
+      end
+
+      local textWidth = style.font:getWidth(text)
+      if currentLine.width + textWidth <= width then
+        appendLayoutRun(currentLine, text, style)
+      else
+        startNewLine()
+      end
+      return
+    end
+
+    local remaining = text
+    while remaining ~= "" do
+      local availableWidth = width - currentLine.width
+      local remainingWidth = style.font:getWidth(remaining)
+
+      if currentLine.width == 0 and remainingWidth <= width then
+        appendLayoutRun(currentLine, remaining, style)
+        remaining = ""
+      elseif currentLine.width > 0 and remainingWidth <= availableWidth then
+        appendLayoutRun(currentLine, remaining, style)
+        remaining = ""
+      elseif currentLine.width > 0 then
+        startNewLine()
+      else
+        local chunk, rest = takeChunkThatFits(remaining, style.font, width)
+        appendLayoutRun(currentLine, chunk, style)
+        remaining = rest
+        if remaining ~= "" then
+          startNewLine()
+        end
+      end
+    end
+  end
+
+  for _, token in ipairs(renderTokens) do
+    if token.type == "newline" then
+      startNewLine()
+    else
+      local currentText = ""
+      local currentIsSpace = nil
+
+      for _, codepoint in utf8.codes(token.text) do
+        local character = utf8.char(codepoint)
+        local isSpace = character == " " or character == "\t"
+
+        if currentIsSpace == nil or currentIsSpace == isSpace then
+          currentText = currentText .. character
+        else
+          placeText(currentText, token.style, currentIsSpace)
+          currentText = character
+        end
+
+        currentIsSpace = isSpace
+      end
+
+      if currentText ~= "" then
+        placeText(currentText, token.style, currentIsSpace)
+      end
+    end
+  end
+
+  local totalHeight = 0
+  for _, line in ipairs(lines) do
+    totalHeight = totalHeight + line.height
+  end
+
+  return {
+    lines = lines,
+    height = totalHeight,
+  }
+end
+
+local function drawLayout(layout, visibleCount, x, y)
+  local remaining = visibleCount
+  local offsetY = 0
+
+  for _, line in ipairs(layout.lines) do
+    local lineX = x
+
+    for _, run in ipairs(line.runs) do
+      if remaining <= 0 then
+        return
+      end
+
+      local charsToDraw = math.min(run.length, remaining)
+      if charsToDraw > 0 then
+        local text = run.text
+        if charsToDraw < run.length then
+          text = utf8.sub(run.text, 1, charsToDraw)
+        end
+
+        love.graphics.setFont(run.style.font)
+        love.graphics.setColor(run.style.color)
+        love.graphics.print(text, lineX, y + offsetY)
+
+        lineX = lineX + run.style.font:getWidth(text)
+        remaining = remaining - charsToDraw
+      end
+    end
+
+    offsetY = offsetY + line.height
+  end
+end
+
+function Typer.new(messageInput, context)
+  local parsed = parseMessage(messageInput, context)
+  local timeToType = findFirstCharacterSpeed(parsed.charSteps, context.textSpeed)
+
   return setmetatable({
-    msg = msg, complete = false, paused = false,
-    timer = timeToType, max = timeToType, position = 1, strip = strip,
+    renderTokens = parsed.renderTokens,
+    charSteps = parsed.charSteps,
+    pauseCounts = parsed.pauseCounts,
+    visibleLength = parsed.visibleLength,
+    visibleCount = 0,
+    complete = parsed.visibleLength == 0 and next(parsed.pauseCounts) == nil,
+    paused = false,
+    timer = timeToType,
+    layout = nil,
+    layoutWidth = nil,
+    layoutDefaultLineHeight = nil,
   },{__index=Typer})
 end
 
 function Typer:resume()
   if not self.paused then return end
-  self.msg = self.msg:gsub("%-%-", "", 1)
-  self.strip = self.strip:gsub("%-%-", "", 1)
   self.paused = false
+  self.complete = self.visibleCount >= self.visibleLength and self.pauseCounts[self.visibleCount] == nil
 end
 
 function Typer:finish()
   if self.complete then return end
-  self.msg = self.msg:gsub("%-%-", "")
-  self.strip = self.strip:gsub("%-%-", "")
-  self.position = utf8.len(self.strip)
+  self.pauseCounts = {}
+  self.visibleCount = self.visibleLength
+  self.paused = false
   self.complete = true
+end
+
+function Typer:pauseAtCurrentBoundary()
+  local pauseCount = self.pauseCounts[self.visibleCount]
+  if pauseCount == nil then
+    return false
+  end
+
+  if pauseCount == 1 then
+    self.pauseCounts[self.visibleCount] = nil
+  else
+    self.pauseCounts[self.visibleCount] = pauseCount - 1
+  end
+
+  self.paused = true
+  self.complete = false
+  return true
+end
+
+function Typer:getLayout(width, defaultLineHeight)
+  if self.layout == nil or self.layoutWidth ~= width or self.layoutDefaultLineHeight ~= defaultLineHeight then
+    self.layout = layoutMessage(self.renderTokens, width, defaultLineHeight)
+    self.layoutWidth = width
+    self.layoutDefaultLineHeight = defaultLineHeight
+  end
+
+  return self.layout
 end
 
 function Typer:update(dt)
   local typed = false
-  
+
   if self.complete then return typed end
   if not self.paused then
+    if self:pauseAtCurrentBoundary() then
+      return typed
+    end
+
     self.timer = self.timer - dt
     while not self.paused and not self.complete and self.timer <= 0 do
-      typed = utf8.sub(self.strip, self.position, self.position) ~= " "
-      self.position = self.position + 1
-      
-      self.timer = self.timer + self.max
-      
-      self.complete = self.position >= utf8.len(self.strip)
-      
-      self.paused = utf8.sub(self.strip, self.position + 1, self.position + 2) == "--"
+      local nextChar = self.charSteps[self.visibleCount + 1]
+      if nextChar == nil then
+        self.complete = true
+        break
+      end
+
+      typed = nextChar.audible
+      self.visibleCount = self.visibleCount + 1
+
+      self.timer = self.timer + nextChar.speed
+
+      if self:pauseAtCurrentBoundary() then
+        break
+      end
+
+      self.complete = self.visibleCount >= self.visibleLength
     end
   end
-  
+
   return typed
 end
 
@@ -124,6 +597,7 @@ local Talkies = {
   talkSound               = nil,
   optionSwitchSound       = nil,
   inlineOptions           = true,
+  richFonts               = {},
   
   titleColor              = {1, 1, 1},
   titleBackgroundColor    = nil,
@@ -149,19 +623,37 @@ local Talkies = {
   height                  = nil,
 }
 
+function Talkies.rich(message)
+  assert(type(message) == "string", "Talkies.rich() - Expected string, got " .. type(message))
+
+  return {
+    _talkiesRich = true,
+    source = message,
+  }
+end
+
 function Talkies.say(title, messages, config)
   config = config or {}
-  if type(messages) ~= "table" then
+
+  if type(messages) ~= "table" or isRichMessage(messages) then
     messages = { messages }
   end
 
-  msgFifo = Fifo.new()
-  
-  for i=1, #messages do
-    msgFifo:push(Typer.new(messages[i], config.textSpeed or Talkies.textSpeed))
-  end
-
   local font = config.font or Talkies.font
+  local messageColor = config.messageColor or Talkies.messageColor
+  local defaultSpeed = parseSpeed(config.textSpeed or Talkies.textSpeed)
+  local richFonts = config.richFonts or Talkies.richFonts or {}
+  local parseContext = {
+    font = font,
+    messageColor = messageColor,
+    textSpeed = defaultSpeed,
+    richFonts = richFonts,
+  }
+
+  local msgFifo = Fifo.new()
+  for i=1, #messages do
+    msgFifo:push(Typer.new(messages[i], parseContext))
+  end
 
   -- Insert the Talkies.new into its own instance (table)
   local newDialog = {
@@ -181,7 +673,7 @@ function Talkies.say(title, messages, config)
     thickness              = config.thickness or Talkies.thickness,
     talkSound              = config.talkSound or Talkies.talkSound,
     optionSwitchSound      = config.optionSwitchSound or Talkies.optionSwitchSound,
-    inlineOptions          = config.inlineOptions or Talkies.inlineOptions,
+    inlineOptions          = config.inlineOptions == nil and Talkies.inlineOptions or config.inlineOptions,
     font                   = font,
     fontHeight             = font:getHeight(" "),
     typedNotTalked         = config.typedNotTalked == nil and Talkies.typedNotTalked or config.typedNotTalked,
@@ -196,7 +688,7 @@ function Talkies.say(title, messages, config)
   newDialog.messageBackgroundColor = config.messageBackgroundColor or Talkies.messageBackgroundColor
   newDialog.titleBackgroundColor = config.titleBackgroundColor or Talkies.titleBackgroundColor or newDialog.messageBackgroundColor
   
-  newDialog.messageColor = config.messageColor or Talkies.messageColor
+  newDialog.messageColor = messageColor
   newDialog.titleColor = config.titleColor or Talkies.titleColor or newDialog.messageColor
   
   newDialog.messageBorderColor = config.messageBorderColor or Talkies.messageBorderColor or newDialog.messageBackgroundColor
@@ -228,7 +720,7 @@ function Talkies.update(dt)
   if currentMessage:update(dt) then
     if currentDialog.typedNotTalked then
       playSound(currentDialog.talkSound)
-    elseif not currentDialog.talkSound:isPlaying() then
+    elseif type(currentDialog.talkSound) == "userdata" and not currentDialog.talkSound:isPlaying() then
       local pitch = currentDialog.pitchValues[math.random(#currentDialog.pitchValues)]
       playSound(currentDialog.talkSound, pitch)
     end
@@ -330,30 +822,17 @@ function Talkies.draw()
   -- Message text
   love.graphics.setColor(currentDialog.messageColor)
   local textW = boxW - imgW - (4 * currentDialog.padding)
-  local textH = currentDialog.font:getHeight()
-  
-  local _, modmsg = currentDialog.font:getWrap(currentMessage.msg, textW)
-  
-  local tempPosition = 1
-  local lineNum = 1
-  
-  while tempPosition < currentMessage.position and utf8.len(currentMessage.strip) > 0 do
-    local displayLine = modmsg[lineNum]
-    
-    local positionAdd = math.min(currentMessage.position - tempPosition + 1, utf8.len(displayLine))
-    tempPosition = tempPosition + positionAdd
-    
-    local display = utf8.sub(displayLine, 1, positionAdd)
-    
-    love.graphics.print(display, textX, textY + textH * (lineNum - 1))
-    
-    lineNum = lineNum + 1
-  end
+  local layout = currentMessage:getLayout(textW, currentDialog.fontHeight)
+
+  drawLayout(layout, currentMessage.visibleCount, textX, textY)
+
+  love.graphics.setFont(currentDialog.font)
+  love.graphics.setColor(currentDialog.messageColor)
 
   -- Message options (when shown)
   if currentDialog:showOptions() and currentMessage.complete then
     if currentDialog.inlineOptions then
-      local optionsY = textY + currentDialog.font:getHeight() * #modmsg
+      local optionsY = textY + layout.height
       local optionLeftPad = currentDialog.font:getWidth(currentDialog.optionCharacter.." ")
       for k, option in pairs(currentDialog.options) do
         love.graphics.print(option[1], optionLeftPad+textX+currentDialog.padding, optionsY+((k-1)*currentDialog.fontHeight))

@@ -7,8 +7,12 @@ function love.load()
   -- The FontStruction “Pixel UniCode” (https://fontstruct.com/fontstructions/show/908795)
   -- by “ivancr72” is licensed under a Creative Commons Attribution license
   -- (http://creativecommons.org/licenses/by/3.0/)
+  local fallbackFont = love.graphics.newFont("assets/fonts/JPfallback.ttf", 32)
   Talkies.font = love.graphics.newFont("assets/fonts/Pixel UniCode.ttf", 32)
-  Talkies.font:setFallbacks(love.graphics.newFont("assets/fonts/JPfallback.ttf", 32)) -- Add font fallbacks for Japanese characters
+  Talkies.font:setFallbacks(fallbackFont) -- Add font fallbacks for Japanese characters
+  Talkies.richFonts = {
+    emphasis = love.graphics.newFont(42)
+  }
 
   -- Audio from bfxr (https://www.bfxr.net/)
   Talkies.talkSound = love.audio.newSource("assets/sfx/typeSound.wav", "static")
@@ -23,9 +27,12 @@ function love.load()
 
   -- Put some messages into the talkies queue
   Talkies.say(
-    "Tutorial",
-    "Typing sound is aligned with the text speed...",
-    { textSpeed = "slow" }
+    "Rich text",
+    Talkies.rich(
+      "Talkies now supports [color=#ffd166]inline color[/color],[br]" ..
+      "[font=emphasis]font swaps[/font], [pause]" ..
+      "[speed=slow]speed changes[/speed], and manual line breaks."
+    )
   )
   Talkies.say(
     "Tutorial",
@@ -70,8 +77,7 @@ end
 
 function red()
   love.graphics.setBackgroundColor(1,0,0)
-  Talkies.say("Hey!", "You picked Red!")
-  moreMessages()
+  Talkies.say("Hey!", "You picked Red! That means the story is over now...")
 end
 
 function blue()

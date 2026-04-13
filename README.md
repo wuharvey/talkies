@@ -9,6 +9,7 @@ Talkies.say("Title", "Hello world!")
 - Multiple choices prompt
 - Typing effect + sounds
 - Pauses
+- Inline rich text tags
 - UTF-8 support
 - Message box icons
 - Autowrapped text
@@ -51,7 +52,7 @@ end
 Create a new dialog of messages and returns that dialog.
 
 - **title** : string; if set to `""`, title box will not appear
-- **messages**, a string or a table that contains strings
+- **messages**, a string, `Talkies.rich("...")`, or a table that contains strings and/or rich messages
 - **config**, table that contains message configs, takes;
   * `image`, message icon image e.g. `love.graphics.newImage("img.png")`
   * `onstart(dialog)`, function to be executed on message start
@@ -69,10 +70,26 @@ on your UI configuration.
 To change the appearance of each message please pass in the theming values described
 below
 
+### Talkies.rich(message)
+Marks a message string as rich text so inline tags will be parsed.
+
+Supported tags:
+* `[color=#RRGGBB]...[/color]`
+* `[color=#RRGGBBAA]...[/color]`
+* `[font=name]...[/font]`
+* `[speed=slow]...[/speed]`
+* `[speed=medium]...[/speed]`
+* `[speed=fast]...[/speed]`
+* `[speed=0.03]...[/speed]`
+* `[pause]`
+* `[br]`
+
+Fonts referenced by `[font=name]` come from `Talkies.richFonts` or `config.richFonts`.
+
 #### Pauses
 A double dash `--` causes them message to stop typing, and will only continue when
-`Talkies.selectButton` is pressed. (Be sure to follow each `--` with a space if you
-want text to wrap correctly!)
+`Talkies.selectButton` is pressed. `[pause]` is the rich-text equivalent.
+(Be sure to follow each `--` with a space if you want text to wrap correctly!)
 
 ### Talkies.update(dt)
 Update will update the UI with the dt and animate the typing
@@ -116,6 +133,7 @@ The following are all of the message theme options:
 * `optionCharacter` - Character before option to indicate selection (string), default: "-"
 * `inlineOptions` - Sets whether options should be displayed within the message box or if they should be displayed in a separate box, default: `true`
 * `font` - Message box font (e.g. `Talkies.font = love.graphics.newFont("Talkies/main.ttf", 32)`)
+* `richFonts` - table of named fonts that can be used by `[font=name]` rich-text tags
 * `padding` - padding on the inside of the box, default is `10`
 * `thickness` - thickness of box borders. Default is `0` (no border).
 * `rounding` - radius in pixels of box corners. Default is `0` (no rounding).
